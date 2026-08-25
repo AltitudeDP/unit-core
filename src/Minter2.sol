@@ -48,6 +48,8 @@ contract Minter2 is AccessControl, EIP712, Nonces {
     bytes32 public constant REDEEM_TYPEHASH =
         keccak256("Redeem(address account,uint256 assets,bool unstake,uint256 nonce,uint256 deadline)");
 
+    uint256 public constant MAX_BPS = 10_000;
+
     IERC20 public immutable USDT;
     Unit public immutable UNIT;
     IERC20 public immutable USDD;
@@ -55,12 +57,20 @@ contract Minter2 is AccessControl, EIP712, Nonces {
     ICErc20 public immutable jUSDD;
     StakedUnit public immutable stakedUnit;
 
+    address public treasury;
+    uint16 public feeBps;
+
     event Minted(address indexed account, uint256 assets);
     event Redeemed(address indexed account, uint256 assets);
+    event NativeValueReceived(address indexed sender, uint256 amount);
+    event FeeConfigUpdated(address indexed treasury, uint16 feeBps);
 
     error ZeroAddress();
     error PermitExpired();
     error OperationFailed();
+    error InsufficientOutput();
+    error InvalidIntegration();
+    error InvalidFee();
 
     constructor(
         address admin_,
@@ -69,31 +79,51 @@ contract Minter2 is AccessControl, EIP712, Nonces {
         IERC20 usdd_,
         IPSM psm_,
         ICErc20 jUsdd_,
-        StakedUnit stakedUnit_
+        StakedUnit stakedUnit_,
+        address treasury_,
+        uint16 feeBps_
     ) EIP712("Unit Minter", "3") {
         if (
             admin_ == address(0) || address(usdt_) == address(0) || address(unit_) == address(0)
                 || address(usdd_) == address(0) || address(psm_) == address(0) || address(jUsdd_) == address(0)
                 || address(stakedUnit_) == address(0)
         ) revert ZeroAddress();
+
+        if (stakedUnit_.asset() != address(unit_)) revert InvalidIntegration();
+
+        if (feeBps_ > MAX_BPS) revert InvalidFee();
+        if (feeBps_ > 0 && treasury_ == address(0)) revert ZeroAddress();
+
         USDT = usdt_;
         UNIT = unit_;
         USDD = usdd_;
         PSM = psm_;
         jUSDD = jUsdd_;
         stakedUnit = stakedUnit_;
+        treasury = treasury_;
+        feeBps = feeBps_;
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin_);
         _grantRole(KEEPER_ROLE, admin_);
 
         USDT.forceApprove(address(this), type(uint256).max);
         USDT.forceApprove(psm_.gemJoin(), type(uint256).max);
-        USDD.forceApprove(address(jUsdd_), type(uint256).max);
-        USDD.forceApprove(address(psm_), type(uint256).max);
         UNIT.forceApprove(address(stakedUnit_), type(uint256).max);
     }
 
-    function mint(uint256 assets, bool stake, uint256 deadline, bytes calldata signature) external {
+    function setFeeConfig(address treasury_, uint16 feeBps_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (feeBps_ > MAX_BPS) revert InvalidFee();
+        if (feeBps_ > 0 && treasury_ == address(0)) revert ZeroAddress();
+        treasury = treasury_;
+        feeBps = feeBps_;
+        emit FeeConfigUpdated(treasury_, feeBps_);
+    }
+
+    receive() external payable {
+        emit NativeValueReceived(msg.sender, msg.value);
+    }
+
+    function mint(uint256 assets, bool stake, uint256 minUnitOut, uint256 deadline, bytes calldata signature) external {
         _checkPermit(
             _hashTypedDataV4(
                 keccak256(abi.encode(MINT_TYPEHASH, msg.sender, assets, stake, _useNonce(msg.sender), deadline))
@@ -102,18 +132,20 @@ contract Minter2 is AccessControl, EIP712, Nonces {
             signature
         );
         uint256 unitToMint = _mintInternal(assets);
-        if (unitToMint > 0) {
-            if (stake) {
-                UNIT.mint(address(this), unitToMint);
-                stakedUnit.deposit(unitToMint, msg.sender);
-            } else {
-                UNIT.mint(msg.sender, unitToMint);
-            }
+        if (assets == 0 || unitToMint == 0 || unitToMint < minUnitOut) revert InsufficientOutput();
+
+        if (stake) {
+            UNIT.mint(address(this), unitToMint);
+            stakedUnit.deposit(unitToMint, msg.sender);
+        } else {
+            UNIT.mint(msg.sender, unitToMint);
         }
         emit Minted(msg.sender, unitToMint);
     }
 
-    function redeem(uint256 assets, bool unstake, uint256 deadline, bytes calldata signature) external {
+    function redeem(uint256 assets, bool unstake, uint256 minUsdtOut, uint256 deadline, bytes calldata signature)
+        external
+    {
         _checkPermit(
             _hashTypedDataV4(
                 keccak256(abi.encode(REDEEM_TYPEHASH, msg.sender, assets, unstake, _useNonce(msg.sender), deadline))
@@ -123,30 +155,42 @@ contract Minter2 is AccessControl, EIP712, Nonces {
         );
         if (unstake) {
             stakedUnit.withdraw(assets, address(this), msg.sender);
-            UNIT.burn(address(this), assets);
+            UNIT.burn(assets);
         } else {
-            UNIT.burn(msg.sender, assets);
+            UNIT.burnFrom(msg.sender, assets);
         }
+        uint256 balanceBefore = USDT.balanceOf(msg.sender);
         _redeemInternal(assets);
+        uint256 actualOut = USDT.balanceOf(msg.sender) - balanceBefore;
+        if (assets == 0 || actualOut == 0 || actualOut < minUsdtOut) revert InsufficientOutput();
     }
 
-    /// @notice Withdraws USDD from Minter2's balance, wraps it to jUSDD, and mints UNIT to the distributor.
-    function distributeRewards(uint256 usddAmount, address distributor) external onlyRole(KEEPER_ROLE) {
-        _checkRole(DISTRIBUTOR_ROLE, distributor);
-        if (usddAmount == 0) return;
-
-        // 1. Wrap USDD to jUSDD
-        if (jUSDD.mint(usddAmount) != 0) revert OperationFailed();
-
-        // 2. Mint UNIT 1:1 to distributor (offsetting 12 decimals)
-        UNIT.mint(distributor, usddAmount / 1e12);
-    }
-
-    function multiClaimJustLendRewards(IMultiMerkleDistributor.ClaimParam[] calldata claims)
+    /// @notice Atomically claims rewards from JustLend, wraps them to jUSDD, and mints UNIT to distributor and treasury.
+    function claimAndDistributeRewards(IMultiMerkleDistributor.ClaimParam[] calldata claims, address distributor)
         external
         onlyRole(KEEPER_ROLE)
     {
+        _checkRole(DISTRIBUTOR_ROLE, distributor);
+        uint256 balanceBefore = USDD.balanceOf(address(this));
         IMultiMerkleDistributor(JUSTLEND_DISTRIBUTOR).multiClaim(claims);
+        uint256 claimed = USDD.balanceOf(address(this)) - balanceBefore;
+        if (claimed == 0) return;
+
+        _depositToJustLend(claimed);
+        uint256 totalUnits = claimed / 1e12;
+
+        if (feeBps > 0 && treasury != address(0)) {
+            uint256 feeUnits = (totalUnits * feeBps) / MAX_BPS;
+            uint256 distributorUnits = totalUnits - feeUnits;
+            if (feeUnits > 0) {
+                UNIT.mint(treasury, feeUnits);
+            }
+            if (distributorUnits > 0) {
+                UNIT.mint(distributor, distributorUnits);
+            }
+        } else {
+            UNIT.mint(distributor, totalUnits);
+        }
     }
 
     function withdraw(IERC20 token, address to, uint256 amount) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -154,11 +198,17 @@ contract Minter2 is AccessControl, EIP712, Nonces {
         token.safeTransferFrom(address(this), to, amount);
     }
 
-    function executeCall(address target, uint256 value, bytes calldata data) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function executeCall(address target, uint256 value, bytes calldata data)
+        external
+        payable
+        onlyRole(DEFAULT_ADMIN_ROLE)
+        returns (bytes memory)
+    {
         if (target == address(0)) revert ZeroAddress();
 
-        (bool success,) = target.call{value: value}(data);
+        (bool success, bytes memory returndata) = target.call{value: value}(data);
         if (!success) revert OperationFailed();
+        return returndata;
     }
 
     function _mintInternal(uint256 assets) private returns (uint256) {
@@ -168,8 +218,21 @@ contract Minter2 is AccessControl, EIP712, Nonces {
         PSM.sellGem(address(this), assets);
         uint256 usddReceived = USDD.balanceOf(address(this)) - usddBefore;
 
-        if (usddReceived > 0 && jUSDD.mint(usddReceived) != 0) revert OperationFailed();
-        return usddReceived / 1e12;
+        if (usddReceived > 0) {
+            _depositToJustLend(usddReceived);
+        }
+        uint256 unitToMint = usddReceived / 1e12;
+        if (assets > 0 && unitToMint == 0) revert InsufficientOutput();
+        return unitToMint;
+    }
+
+    function _depositToJustLend(uint256 usddAmount) private {
+        uint256 sharesBefore = IERC20(address(jUSDD)).balanceOf(address(this));
+        USDD.forceApprove(address(jUSDD), usddAmount);
+        if (jUSDD.mint(usddAmount) != 0) revert OperationFailed();
+        USDD.forceApprove(address(jUSDD), 0);
+        uint256 sharesReceived = IERC20(address(jUSDD)).balanceOf(address(this)) - sharesBefore;
+        if (sharesReceived == 0) revert OperationFailed();
     }
 
     function _redeemInternal(uint256 assets) private {
@@ -180,7 +243,9 @@ contract Minter2 is AccessControl, EIP712, Nonces {
         if (usddRequired > usddBalance && jUSDD.redeemUnderlying(usddRequired - usddBalance) != 0) {
             revert OperationFailed();
         }
+        USDD.forceApprove(address(PSM), usddRequired);
         PSM.buyGem(address(this), gemAmt);
+        USDD.forceApprove(address(PSM), 0);
         USDT.safeTransferFrom(address(this), msg.sender, gemAmt);
         emit Redeemed(msg.sender, gemAmt);
     }
