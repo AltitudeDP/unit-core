@@ -16,7 +16,7 @@ contract ForkMainnetTest is Test {
     // Real mainnet addresses
     address constant USDT_ADDR = 0xa614f803B6FD780986A42c78Ec9c7f77e6DeD13C;
     address constant USDD_ADDR = 0xE91A7411e56Ce79E83570570f49B9FC35B7727c5;
-    address constant PSM_ADDR = 0xB50Eb419ebeBA06c80Df5e9AaeC494Cef4297879;
+    address constant PSM_ADDR = 0x1113AE08A16489A7B76f2Ccc52290ab54E2783d8;
     address constant jUSDD_ADDR = 0x65c9feDE72Ba73CD1B0DCA2A974C070153dC6FCB;
 
     MockTRONUSDT usdt;
@@ -71,8 +71,7 @@ contract ForkMainnetTest is Test {
         vm.prank(admin);
         distributor = new CumulativeMerkleDrop(UNIT, bytes32(0));
 
-        minter2 =
-            new Minter2(admin, IERC20(USDT_ADDR), UNIT, IERC20(USDD_ADDR), IPSM(PSM_ADDR), ICErc20(jUSDD_ADDR), sUNIT);
+        minter2 = new Minter2(admin, UNIT, sUNIT);
 
         // Setup access control roles
         vm.startPrank(admin);
@@ -134,6 +133,10 @@ contract ForkMainnetTest is Test {
         UNIT.approve(address(sUNIT), 100e6);
         sUNIT.deposit(100e6, userA);
 
+        // 0-value transfer is permitted for ERC20 compatibility
+        bool success = sUNIT.transfer(userB, 0);
+        assertTrue(success);
+
         // Direct transfer must revert with NonTransferable
         vm.expectRevert(StakedUnit.NonTransferable.selector);
         sUNIT.transfer(userB, 10e6);
@@ -180,6 +183,52 @@ contract ForkMainnetTest is Test {
         assertEq(sUNIT.totalAssets(), 0);
     }
 
+    function testVaultSolvencyProtection() public {
+        vm.prank(admin);
+        UNIT.mint(userA, 100e6);
+
+        vm.startPrank(userA);
+        UNIT.approve(address(sUNIT), 100e6);
+        sUNIT.deposit(100e6, userA);
+        vm.stopPrank();
+
+        // Simulate deficit: confiscate 50 UNIT directly from sUNIT
+        vm.prank(admin);
+        UNIT.confiscate(address(sUNIT), admin, 50e6);
+
+        // Vault is now undercollateralized (50 assets vs 100 shares)
+        assertEq(sUNIT.totalAssets(), 50e6);
+        assertEq(sUNIT.totalSupply(), 100e6);
+
+        // max limits must report 0
+        assertEq(sUNIT.maxDeposit(userA), 0);
+        assertEq(sUNIT.maxMint(userA), 0);
+        assertEq(sUNIT.maxWithdraw(userA), 0);
+        assertEq(sUNIT.maxRedeem(userA), 0);
+
+        // Operations revert with max limit exceeded / VaultInsolvent
+        vm.startPrank(userA);
+        vm.expectRevert();
+        sUNIT.deposit(10e6, userA);
+
+        vm.expectRevert();
+        sUNIT.redeem(50e6, userA, userA);
+        vm.stopPrank();
+
+        // Recapitalize vault
+        vm.prank(admin);
+        UNIT.mint(address(sUNIT), 50e6);
+
+        // Solvency restored
+        assertEq(sUNIT.totalAssets(), 100e6);
+        assertTrue(sUNIT.maxRedeem(userA) > 0);
+
+        vm.startPrank(userA);
+        sUNIT.redeem(100e6, userA, userA);
+        vm.stopPrank();
+        assertEq(UNIT.balanceOf(userA), 100e6);
+    }
+
     function testVaultZeroDepositReverts() public {
         vm.startPrank(userA);
         UNIT.approve(address(sUNIT), 100e6);
@@ -199,14 +248,34 @@ contract ForkMainnetTest is Test {
         vm.expectRevert();
         UNIT.mint(userA, 100e6);
 
-        // User A tries to burn
-        vm.expectRevert();
-        UNIT.burn(userA, 100e6);
-
         // User A tries to confiscate
         vm.expectRevert();
         UNIT.confiscate(userA, userB, 100e6);
         vm.stopPrank();
+    }
+
+    function testUnitBurnAndBurnFrom() public {
+        vm.prank(admin);
+        UNIT.mint(userA, 100e6);
+
+        // User A burns own tokens
+        vm.prank(userA);
+        UNIT.burn(40e6);
+        assertEq(UNIT.balanceOf(userA), 60e6);
+
+        // User B cannot burnFrom user A without allowance
+        vm.prank(userB);
+        vm.expectRevert();
+        UNIT.burnFrom(userA, 20e6);
+
+        // User A gives allowance to user B
+        vm.prank(userA);
+        UNIT.approve(userB, 20e6);
+
+        // User B burns with allowance
+        vm.prank(userB);
+        UNIT.burnFrom(userA, 20e6);
+        assertEq(UNIT.balanceOf(userA), 40e6);
     }
 
     function testMinterRoleAccessControl() public {
@@ -230,6 +299,66 @@ contract ForkMainnetTest is Test {
         assertEq(UNIT.balanceOf(admin), 100e6);
     }
 
+    function testUnitFreezingAndConfiscation() public {
+        vm.prank(admin);
+        UNIT.mint(userA, 100e6);
+
+        // Admin freezes userA
+        vm.prank(admin);
+        UNIT.setFrozen(userA, true);
+        assertTrue(UNIT.isFrozen(userA));
+
+        // Frozen userA cannot transfer
+        vm.startPrank(userA);
+        vm.expectRevert(Unit.AccountFrozen.selector);
+        UNIT.transfer(userB, 50e6);
+        vm.stopPrank();
+
+        // Frozen userA cannot deposit into sUNIT
+        vm.startPrank(userA);
+        UNIT.approve(address(sUNIT), 50e6);
+        vm.expectRevert(StakedUnit.AccountFrozen.selector);
+        sUNIT.deposit(50e6, userA);
+        vm.stopPrank();
+
+        // Admin can confiscate from frozen userA
+        vm.prank(admin);
+        UNIT.confiscate(userA, admin, 100e6);
+        assertEq(UNIT.balanceOf(userA), 0);
+        assertEq(UNIT.balanceOf(admin), 100e6);
+
+        // Unfreeze
+        vm.prank(admin);
+        UNIT.setFrozen(userA, false);
+        assertFalse(UNIT.isFrozen(userA));
+    }
+
+    function testStakedUnitConfiscation() public {
+        vm.prank(admin);
+        UNIT.mint(userA, 100e6);
+
+        vm.startPrank(userA);
+        UNIT.approve(address(sUNIT), 100e6);
+        sUNIT.deposit(100e6, userA);
+        vm.stopPrank();
+
+        assertEq(sUNIT.balanceOf(userA), 100e6);
+
+        // Non-admin cannot confiscate sUNIT
+        vm.prank(userB);
+        vm.expectRevert(StakedUnit.Unauthorized.selector);
+        sUNIT.confiscate(userA, userB, 100e6);
+
+        // Admin confiscates sUNIT shares
+        vm.prank(admin);
+        sUNIT.confiscate(userA, admin, 100e6);
+
+        assertEq(sUNIT.balanceOf(userA), 0);
+        assertEq(UNIT.balanceOf(admin), 100e6);
+        assertEq(sUNIT.totalAssets(), 0);
+        assertEq(sUNIT.totalSupply(), 0);
+    }
+
     /* =========================================================================
        3. MINTER2 INTEGRATION TESTS (USDD, PSM, JUSTLEND, YIELD HARVEST)
        ========================================================================= */
@@ -248,7 +377,7 @@ contract ForkMainnetTest is Test {
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
 
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
-        minter2.mint(100e6, false, deadline, abi.encodePacked(r, s, v));
+        minter2.mint(100e6, false, 100e6, deadline, abi.encodePacked(r, s, v));
         vm.stopPrank();
 
         // Checks:
@@ -262,12 +391,13 @@ contract ForkMainnetTest is Test {
 
         // --- 2. Redeem ---
         vm.startPrank(userA);
+        UNIT.approve(address(minter2), 40e6);
         nonce = minter2.nonces(userA);
         structHash = keccak256(abi.encode(minter2.REDEEM_TYPEHASH(), userA, 40e6, false, nonce, deadline));
         digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
 
         (v, r, s) = vm.sign(signerKey, digest);
-        minter2.redeem(40e6, false, deadline, abi.encodePacked(r, s, v));
+        minter2.redeem(40e6, false, 40e6, deadline, abi.encodePacked(r, s, v));
         vm.stopPrank();
 
         // Checks:
@@ -292,7 +422,7 @@ contract ForkMainnetTest is Test {
         bytes32 structHash = keccak256(abi.encode(minter2.MINT_TYPEHASH(), userA, 100e6, false, nonce, deadline));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
-        minter2.mint(100e6, false, deadline, abi.encodePacked(r, s, v));
+        minter2.mint(100e6, false, 0, deadline, abi.encodePacked(r, s, v));
         vm.stopPrank();
 
         // userB deposits 200 USDT
@@ -302,7 +432,7 @@ contract ForkMainnetTest is Test {
         structHash = keccak256(abi.encode(minter2.MINT_TYPEHASH(), userB, 200e6, false, nonce, deadline));
         digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
         (v, r, s) = vm.sign(signerKey, digest);
-        minter2.mint(200e6, false, deadline, abi.encodePacked(r, s, v));
+        minter2.mint(200e6, false, 0, deadline, abi.encodePacked(r, s, v));
         vm.stopPrank();
 
         // --- Off-Chain Admin Calculation Helper ---
@@ -367,7 +497,7 @@ contract ForkMainnetTest is Test {
         bytes32 structHash = keccak256(abi.encode(minter2.MINT_TYPEHASH(), userA, 100e6, false, nonce, deadline));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
-        minter2.mint(100e6, false, deadline, abi.encodePacked(r, s, v));
+        minter2.mint(100e6, false, 0, deadline, abi.encodePacked(r, s, v));
         vm.stopPrank();
 
         // Accrue interest of 50 USDD
@@ -396,16 +526,46 @@ contract ForkMainnetTest is Test {
         vm.prank(admin);
         minter2.withdraw(IERC20(address(jUSDD)), emergencyReceiver, contractjUSDDBalance);
 
-        assertEq(jUSDD.balanceOf(address(minter2)), 0);
         assertEq(jUSDD.balanceOf(emergencyReceiver), contractjUSDDBalance);
+        assertEq(jUSDD.balanceOf(address(minter2)), 0);
     }
 
     function testMinter2WithDeal() public {
-        deal(USDT_ADDR, userA, 500e6);
-        assertEq(usdt.balanceOf(userA), 500e6);
+        usdt.mint(userA, 1000e6);
 
-        deal(USDD_ADDR, userB, 1000e18);
-        assertEq(usdd.balanceOf(userB), 1000e18);
+        // --- 1. Mint ---
+        vm.startPrank(userA);
+        usdt.approve(address(minter2), 100e6);
+
+        uint256 deadline = block.timestamp + 1 hours;
+        uint256 nonce = minter2.nonces(userA);
+
+        bytes32 structHash = keccak256(abi.encode(minter2.MINT_TYPEHASH(), userA, 100e6, false, nonce, deadline));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
+        minter2.mint(100e6, false, 0, deadline, abi.encodePacked(r, s, v));
+        vm.stopPrank();
+
+        assertEq(usdt.balanceOf(userA), 900e6);
+        assertEq(UNIT.balanceOf(userA), 100e6);
+        assertEq(jUSDD.balanceOfUnderlying(address(minter2)), 100e18);
+
+        // --- 2. Redeem ---
+        vm.startPrank(userA);
+        UNIT.approve(address(minter2), 40e6);
+        nonce = minter2.nonces(userA);
+        structHash = keccak256(abi.encode(minter2.REDEEM_TYPEHASH(), userA, 40e6, false, nonce, deadline));
+        digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+
+        (v, r, s) = vm.sign(signerKey, digest);
+        minter2.redeem(40e6, false, 0, deadline, abi.encodePacked(r, s, v));
+        vm.stopPrank();
+
+        assertEq(UNIT.balanceOf(userA), 60e6);
+        assertEq(usdt.balanceOf(userA), 940e6);
+        assertEq(usdt.balanceOf(address(minter2)), 0);
+        assertEq(jUSDD.balanceOfUnderlying(address(minter2)), 60e18);
     }
 
     function testMinter2WithTinAndToutFees() public {
@@ -427,7 +587,7 @@ contract ForkMainnetTest is Test {
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
 
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
-        minter2.mint(100e6, false, deadline, abi.encodePacked(r, s, v));
+        minter2.mint(100e6, false, 98e6, deadline, abi.encodePacked(r, s, v));
         vm.stopPrank();
 
         assertEq(usdt.balanceOf(userA), 900e6);
@@ -436,15 +596,16 @@ contract ForkMainnetTest is Test {
 
         // --- 2. Redeem ---
         vm.startPrank(userA);
-        nonce = minter2.nonces(userA);
         uint256 burnAmt = 98e6;
+        UNIT.approve(address(minter2), burnAmt);
+        nonce = minter2.nonces(userA);
         uint256 expectedGemAmt = (burnAmt * 1e18) / (1e18 + 5 * 10 ** 16);
 
         structHash = keccak256(abi.encode(minter2.REDEEM_TYPEHASH(), userA, burnAmt, false, nonce, deadline));
         digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
 
         (v, r, s) = vm.sign(signerKey, digest);
-        minter2.redeem(burnAmt, false, deadline, abi.encodePacked(r, s, v));
+        minter2.redeem(burnAmt, false, expectedGemAmt, deadline, abi.encodePacked(r, s, v));
         vm.stopPrank();
 
         assertEq(UNIT.balanceOf(userA), 0);
@@ -465,7 +626,7 @@ contract ForkMainnetTest is Test {
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
 
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
-        minter2.mint(100e6, true, deadline, abi.encodePacked(r, s, v));
+        minter2.mint(100e6, true, 100e6, deadline, abi.encodePacked(r, s, v));
         vm.stopPrank();
 
         assertEq(UNIT.balanceOf(userA), 0);
@@ -483,7 +644,7 @@ contract ForkMainnetTest is Test {
         bytes32 structHash = keccak256(abi.encode(minter2.MINT_TYPEHASH(), userA, 100e6, true, nonce, deadline));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
-        minter2.mint(100e6, true, deadline, abi.encodePacked(r, s, v));
+        minter2.mint(100e6, true, 100e6, deadline, abi.encodePacked(r, s, v));
 
         // Now Approve Minter2 to spend sUNIT shares
         sUNIT.approve(address(minter2), 100e6);
@@ -493,29 +654,59 @@ contract ForkMainnetTest is Test {
         structHash = keccak256(abi.encode(minter2.REDEEM_TYPEHASH(), userA, 100e6, true, nonce, deadline));
         digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
         (v, r, s) = vm.sign(signerKey, digest);
-        minter2.redeem(100e6, true, deadline, abi.encodePacked(r, s, v));
+        minter2.redeem(100e6, true, 100e6, deadline, abi.encodePacked(r, s, v));
         vm.stopPrank();
 
         assertEq(sUNIT.balanceOf(userA), 0);
         assertEq(usdt.balanceOf(userA), 1000e6);
     }
 
-    function testMinter2DistributeRewards() public {
-        uint256 rewardAmount = 1000e18; // 1000 USDD
+    function testMinter2SlippageProtection() public {
+        usdt.mint(userA, 1000e6);
 
-        usdd.mint(address(minter2), rewardAmount);
-        assertEq(usdd.balanceOf(address(minter2)), rewardAmount);
+        // Mint with excessive minUnitOut reverts
+        vm.startPrank(userA);
+        usdt.approve(address(minter2), 100e6);
 
-        vm.prank(admin);
-        minter2.distributeRewards(rewardAmount, address(distributor));
+        uint256 deadline = block.timestamp + 1 hours;
+        uint256 nonce = minter2.nonces(userA);
+        bytes32 structHash = keccak256(abi.encode(minter2.MINT_TYPEHASH(), userA, 100e6, false, nonce, deadline));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
 
-        assertEq(usdd.balanceOf(address(minter2)), 0);
-        assertEq(jUSDD.balanceOf(address(minter2)), rewardAmount);
+        vm.expectRevert(Minter2.InsufficientOutput.selector);
+        minter2.mint(100e6, false, 101e6, deadline, abi.encodePacked(r, s, v));
 
-        assertEq(UNIT.balanceOf(address(distributor)), 1000e6);
+        // Successful mint with exact minUnitOut
+        minter2.mint(100e6, false, 100e6, deadline, abi.encodePacked(r, s, v));
+
+        // Redeem with excessive minUsdtOut reverts
+        UNIT.approve(address(minter2), 100e6);
+        nonce = minter2.nonces(userA);
+        structHash = keccak256(abi.encode(minter2.REDEEM_TYPEHASH(), userA, 100e6, false, nonce, deadline));
+        digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        (v, r, s) = vm.sign(signerKey, digest);
+
+        vm.expectRevert(Minter2.InsufficientOutput.selector);
+        minter2.redeem(100e6, false, 101e6, deadline, abi.encodePacked(r, s, v));
+
+        vm.stopPrank();
     }
 
-    function testMinter2ClaimJustLendRewards() public {
+    function testZeroMintReverts() public {
+        vm.startPrank(userA);
+        uint256 deadline = block.timestamp + 1 hours;
+        uint256 nonce = minter2.nonces(userA);
+        bytes32 structHash = keccak256(abi.encode(minter2.MINT_TYPEHASH(), userA, 0, false, nonce, deadline));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
+
+        vm.expectRevert(Minter2.InsufficientOutput.selector);
+        minter2.mint(0, false, 0, deadline, abi.encodePacked(r, s, v));
+        vm.stopPrank();
+    }
+
+    function testMinter2ClaimAndDistributeRewardsAtomic() public {
         MockMultiMerkleDistributor mockDistributorTemplate = new MockMultiMerkleDistributor(IERC20(address(usdd)));
         vm.etch(minter2.JUSTLEND_DISTRIBUTOR(), address(mockDistributorTemplate).code);
 
@@ -533,28 +724,88 @@ contract ForkMainnetTest is Test {
             merkleIndex: 0x1f, index: 0x083c, amounts: amounts, merkleProof: proof
         });
 
+        // Non-keeper reverts
         vm.startPrank(userA);
         vm.expectRevert();
-        minter2.multiClaimJustLendRewards(claims);
+        minter2.claimAndDistributeRewards(claims, address(distributor));
         vm.stopPrank();
 
+        // Keeper executes atomic claim and distribute
         vm.prank(admin);
-        minter2.multiClaimJustLendRewards(claims);
+        minter2.claimAndDistributeRewards(claims, address(distributor));
 
-        assertEq(usdd.balanceOf(address(minter2)), 100e18);
+        assertEq(usdd.balanceOf(address(minter2)), 0);
+        assertEq(jUSDD.balanceOf(address(minter2)), 100e18);
+        assertEq(UNIT.balanceOf(address(distributor)), 100e6);
     }
 
     function testExecuteCall() public {
         vm.startPrank(userA);
         vm.expectRevert();
-        minter2.executeCall(address(usdt), 0, abi.encodeWithSignature("transfer(address,uint256)", userA, 10e6));
+        minter2.executeCall(address(usdd), 0, abi.encodeWithSignature("transfer(address,uint256)", userA, 10e18));
         vm.stopPrank();
 
-        usdt.mint(address(minter2), 10e6);
+        usdd.mint(address(minter2), 10e18);
         vm.prank(admin);
-        minter2.executeCall(address(usdt), 0, abi.encodeWithSignature("transfer(address,uint256)", userA, 10e6));
+        bytes memory ret = minter2.executeCall(address(usdd), 0, abi.encodeWithSignature("transfer(address,uint256)", userA, 10e18));
+        bool success = abi.decode(ret, (bool));
+        assertTrue(success);
 
-        assertEq(usdt.balanceOf(userA), 10e6);
+        assertEq(usdd.balanceOf(userA), 10e18);
+    }
+
+    function testInvalidIntegrationConstructor() public {
+        Unit otherUnit = new Unit(admin);
+        vm.expectRevert(Minter2.InvalidIntegration.selector);
+        new Minter2(admin, otherUnit, sUNIT);
+
+        vm.expectRevert(Minter2.ZeroAddress.selector);
+        new Minter2(address(0), UNIT, sUNIT);
+    }
+
+    function testMinter2ReceiveNativeTRX() public {
+        vm.deal(address(this), 10 ether);
+        (bool success,) = address(minter2).call{value: 1 ether}("");
+        assertTrue(success);
+        assertEq(address(minter2).balance, 1 ether);
+    }
+
+    function testCumulativeMerkleDropOwnership() public {
+        // renounceOwnership reverts
+        vm.prank(admin);
+        vm.expectRevert(CumulativeMerkleDrop.CannotRenounceOwnership.selector);
+        distributor.renounceOwnership();
+
+        // 2-step ownership transfer
+        vm.prank(admin);
+        distributor.transferOwnership(userA);
+        assertEq(distributor.owner(), admin);
+
+        vm.prank(userA);
+        distributor.acceptOwnership();
+        assertEq(distributor.owner(), userA);
+    }
+
+    function testMinter2InflationAttackProtection() public {
+        // Accrue extreme yield to create massive exchange rate discrepancy
+        jUSDD.accrueYield(1000000e18);
+
+        usdt.mint(userA, 100e6);
+        vm.startPrank(userA);
+        usdt.approve(address(minter2), 100e6);
+
+        uint256 deadline = block.timestamp + 1 hours;
+        uint256 nonce = minter2.nonces(userA);
+        bytes32 structHash = keccak256(abi.encode(minter2.MINT_TYPEHASH(), userA, 100e6, false, nonce, deadline));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
+
+        minter2.mint(100e6, false, 0, deadline, abi.encodePacked(r, s, v));
+        vm.stopPrank();
+
+        // UNIT minted should not exceed credited underlying backing
+        assertTrue(UNIT.balanceOf(userA) <= 100e6);
+        assertTrue(UNIT.balanceOf(userA) > 0);
     }
 }
 
