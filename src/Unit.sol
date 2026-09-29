@@ -36,4 +36,9 @@ contract Unit is ERC20, AccessControl {
         if (role == DEFAULT_ADMIN_ROLE) revert CannotRenounceAdmin();
         super.renounceRole(role, callerConfirmation);
     }
+
+    function revokeRole(bytes32 role, address account) public override {
+        if (role == DEFAULT_ADMIN_ROLE) revert CannotRenounceAdmin();
+        super.revokeRole(role, account);
+    }
 }

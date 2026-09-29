@@ -844,10 +844,20 @@ contract ForkMainnetTest is Test {
         vm.prank(admin);
         UNIT.renounceRole(adminRole, admin);
 
+        // UNIT admin revocation reverts
+        vm.expectRevert(Unit.CannotRenounceAdmin.selector);
+        vm.prank(admin);
+        UNIT.revokeRole(adminRole, admin);
+
         // Minter2 admin renouncement reverts
         vm.expectRevert(Minter2.CannotRenounceAdmin.selector);
         vm.prank(admin);
         minter2.renounceRole(adminRole, admin);
+
+        // Minter2 admin revocation reverts
+        vm.expectRevert(Minter2.CannotRenounceAdmin.selector);
+        vm.prank(admin);
+        minter2.revokeRole(adminRole, admin);
 
         // Non-admin roles CAN be renounced
         vm.prank(admin);
@@ -864,6 +874,28 @@ contract ForkMainnetTest is Test {
         vm.prank(admin);
         distributor.setMerkleRoot(validRoot);
         assertEq(distributor.merkleRoot(), validRoot);
+    }
+
+    function testMultipleSequentialMintsWithoutYield() public {
+        // Non-integer exchange rate simulating live mainnet rounding loss
+        jUSDD.accrueYield(1234567890123456);
+
+        usdt.mint(userA, 1000e6);
+        vm.startPrank(userA);
+        usdt.approve(address(minter2), 1000e6);
+
+        // Perform 10 consecutive mints without any yield accrual
+        for (uint256 i = 0; i < 10; i++) {
+            uint256 deadline = block.timestamp + 1 hours;
+            uint256 nonce = minter2.nonces(userA);
+            bytes32 structHash = keccak256(abi.encode(minter2.MINT_TYPEHASH(), userA, 10e6, false, nonce, deadline));
+            bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+            (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
+            minter2.mint(10e6, false, 10e6, deadline, abi.encodePacked(r, s, v));
+        }
+        vm.stopPrank();
+
+        assertEq(UNIT.balanceOf(userA), 100e6);
     }
 }
 

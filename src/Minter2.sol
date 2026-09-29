@@ -124,6 +124,11 @@ contract Minter2 is AccessControl, EIP712, Nonces, Pausable {
         super.renounceRole(role, callerConfirmation);
     }
 
+    function revokeRole(bytes32 role, address account) public override {
+        if (role == DEFAULT_ADMIN_ROLE) revert CannotRenounceAdmin();
+        super.revokeRole(role, account);
+    }
+
     function mint(uint256 assets, bool stake, uint256 minUnitOut, uint256 deadline, bytes calldata signature)
         external
         whenNotPaused
@@ -240,7 +245,7 @@ contract Minter2 is AccessControl, EIP712, Nonces, Pausable {
 
         uint256 backing = USDD.balanceOf(address(this)) + Math.mulDiv(jUSDD.balanceOf(address(this)), rate, 1e18);
         uint256 required = (UNIT.totalSupply() + nominalUnits) * 1e12;
-        if (backing + maxLoss < required) revert OperationFailed();
+        if (backing + 1e12 < required) revert OperationFailed();
 
         return nominalUnits;
     }
