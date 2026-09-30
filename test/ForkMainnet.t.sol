@@ -815,6 +815,12 @@ contract ForkMainnetTest is Test {
         vm.expectRevert(Pausable.EnforcedPause.selector);
         minter2.redeem(100e6, false, 0, deadline, abi.encodePacked(r, s, v));
 
+        // Claim and distribute also reverts when paused
+        IMultiMerkleDistributor.ClaimParam[] memory claims = new IMultiMerkleDistributor.ClaimParam[](0);
+        vm.prank(admin);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        minter2.claimAndDistributeRewards(claims, address(distributor));
+
         // Non-admin cannot unpause
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -896,6 +902,25 @@ contract ForkMainnetTest is Test {
         vm.stopPrank();
 
         assertEq(UNIT.balanceOf(userA), 100e6);
+    }
+
+    function testMintTransferFeeActiveReverts() public {
+        usdt.mint(userA, 100e6);
+        vm.startPrank(userA);
+        usdt.approve(address(minter2), 100e6);
+
+        // Turn on 10 bps fee on transfer
+        usdt.setFeeBps(10);
+
+        uint256 deadline = block.timestamp + 1 hours;
+        uint256 nonce = minter2.nonces(userA);
+        bytes32 structHash = keccak256(abi.encode(minter2.MINT_TYPEHASH(), userA, 100e6, false, nonce, deadline));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
+
+        vm.expectRevert(Minter2.TransferFeeActive.selector);
+        minter2.mint(100e6, false, 0, deadline, abi.encodePacked(r, s, v));
+        vm.stopPrank();
     }
 }
 

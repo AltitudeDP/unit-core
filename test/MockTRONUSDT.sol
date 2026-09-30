@@ -22,9 +22,25 @@ contract MockTRONUSDT is ERC20 {
         _mint(to, amount);
     }
 
+    uint256 public feeBps;
+
+    function setFeeBps(uint256 feeBps_) external {
+        feeBps = feeBps_;
+    }
+
     // Override transfer to return false on success to mimic TRON USDT
     function transfer(address to, uint256 amount) public override returns (bool) {
         _transfer(msg.sender, to, amount);
         return false;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) public override returns (bool) {
+        if (feeBps > 0) {
+            uint256 fee = (amount * feeBps) / 10000;
+            _spendAllowance(from, msg.sender, amount);
+            _transfer(from, to, amount - fee);
+            return true;
+        }
+        return super.transferFrom(from, to, amount);
     }
 }

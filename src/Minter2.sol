@@ -79,6 +79,7 @@ contract Minter2 is AccessControl, EIP712, Nonces, Pausable {
     error InvalidIntegration();
     error InsufficientOutput();
     error CannotRenounceAdmin();
+    error TransferFeeActive();
 
     constructor(address admin_, Unit unit_, StakedUnit stakedUnit_) EIP712("Unit Minter", "3") {
         if (admin_ == address(0) || address(unit_) == address(0) || address(stakedUnit_) == address(0)) {
@@ -179,6 +180,7 @@ contract Minter2 is AccessControl, EIP712, Nonces, Pausable {
     function claimAndDistributeRewards(IMultiMerkleDistributor.ClaimParam[] calldata claims, address distributor)
         external
         onlyRole(KEEPER_ROLE)
+        whenNotPaused
     {
         _checkRole(DISTRIBUTOR_ROLE, distributor);
         uint256 balanceBefore = USDD.balanceOf(address(this));
@@ -212,10 +214,13 @@ contract Minter2 is AccessControl, EIP712, Nonces, Pausable {
     }
 
     function _mintInternal(uint256 assets) private returns (uint256) {
+        uint256 balanceBefore = USDT.balanceOf(address(this));
         USDT.safeTransferFrom(msg.sender, address(this), assets);
+        uint256 received = USDT.balanceOf(address(this)) - balanceBefore;
+        if (received != assets) revert TransferFeeActive();
 
         uint256 usddBefore = USDD.balanceOf(address(this));
-        PSM.sellGem(address(this), assets);
+        PSM.sellGem(address(this), received);
         uint256 usddReceived = USDD.balanceOf(address(this)) - usddBefore;
 
         uint256 unitToMint = _depositToJustLend(usddReceived);
