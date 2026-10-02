@@ -11,8 +11,11 @@ import {MockUSDD} from "./MockUSDD.sol";
 import {MockPSM} from "./MockPSM.sol";
 import {MockjUSDD} from "./MockjUSDD.sol";
 import {CumulativeMerkleDrop} from "../src/CumulativeMerkleDrop.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 contract ForkMainnetTest is Test {
+    event RewardsDistributed(address indexed distributor, uint256 claimedUSDD, uint256 mintedUNIT);
     // Real mainnet addresses
     address constant USDT_ADDR = 0xa614f803B6FD780986A42c78Ec9c7f77e6DeD13C;
     address constant USDD_ADDR = 0xE91A7411e56Ce79E83570570f49B9FC35B7727c5;
@@ -107,23 +110,23 @@ contract ForkMainnetTest is Test {
         vm.stopPrank();
 
         assertEq(sUNIT.balanceOf(userA), 100e6); // 6 decimals (same as unitUSD)
-        assertEq(sUNIT.totalAssets(), 100e6);
+        assertEq(UNIT.balanceOf(address(sUNIT)), 100e6);
 
-        // Warp 365 days - totalAssets remains 100e6 (no yield)
+        // Warp 365 days - balance remains 100e6 (no yield)
         vm.warp(block.timestamp + 365 days);
-        assertEq(sUNIT.totalAssets(), 100e6);
+        assertEq(UNIT.balanceOf(address(sUNIT)), 100e6);
 
-        // Sole holder redeems all shares
+        // Sole holder withdraws all shares
         vm.startPrank(userA);
-        sUNIT.redeem(sUNIT.balanceOf(userA), userA, userA);
+        sUNIT.withdraw(sUNIT.balanceOf(userA), userA, userA);
         vm.stopPrank();
 
         assertEq(UNIT.balanceOf(userA), 100e6);
-        assertEq(sUNIT.totalAssets(), 0);
+        assertEq(UNIT.balanceOf(address(sUNIT)), 0);
         assertEq(sUNIT.totalSupply(), 0);
     }
 
-    function testVaultNonTransferable() public {
+    function testWrapperTransferable() public {
         vm.prank(admin);
         UNIT.mint(userA, 100e6);
 
@@ -135,17 +138,19 @@ contract ForkMainnetTest is Test {
         bool success = sUNIT.transfer(userB, 0);
         assertTrue(success);
 
-        // Direct transfer must revert with NonTransferable
-        vm.expectRevert(StakedUnit.NonTransferable.selector);
+        // Direct transfer works as standard ERC20
         sUNIT.transfer(userB, 10e6);
+        assertEq(sUNIT.balanceOf(userB), 10e6);
+        assertEq(sUNIT.balanceOf(userA), 90e6);
 
-        // transferFrom must also revert with NonTransferable
+        // transferFrom also works
         sUNIT.approve(userB, 10e6);
         vm.stopPrank();
 
         vm.prank(userB);
-        vm.expectRevert(StakedUnit.NonTransferable.selector);
         sUNIT.transferFrom(userA, userB, 10e6);
+        assertEq(sUNIT.balanceOf(userB), 20e6);
+        assertEq(sUNIT.balanceOf(userA), 80e6);
     }
 
     function testVaultMultipleHolders() public {
@@ -166,22 +171,22 @@ contract ForkMainnetTest is Test {
 
         assertEq(sUNIT.balanceOf(userA), 100e6);
         assertEq(sUNIT.balanceOf(userB), 200e6);
-        assertEq(sUNIT.totalAssets(), 300e6);
+        assertEq(UNIT.balanceOf(address(sUNIT)), 300e6);
 
         vm.startPrank(userA);
-        sUNIT.redeem(100e6, userA, userA);
+        sUNIT.withdraw(100e6, userA, userA);
         vm.stopPrank();
 
         vm.startPrank(userB);
-        sUNIT.redeem(200e6, userB, userB);
+        sUNIT.withdraw(200e6, userB, userB);
         vm.stopPrank();
 
         assertEq(UNIT.balanceOf(userA), 100e6);
         assertEq(UNIT.balanceOf(userB), 200e6);
-        assertEq(sUNIT.totalAssets(), 0);
+        assertEq(UNIT.balanceOf(address(sUNIT)), 0);
     }
 
-    function testVaultSolvencyProtection() public {
+    function testWrapper1to1BackingAndUnwrap() public {
         vm.prank(admin);
         UNIT.mint(userA, 100e6);
 
@@ -190,41 +195,18 @@ contract ForkMainnetTest is Test {
         sUNIT.deposit(100e6, userA);
         vm.stopPrank();
 
-        // Simulate deficit: confiscate 50 UNIT directly from sUNIT
-        vm.prank(admin);
-        UNIT.confiscate(address(sUNIT), admin, 50e6);
-
-        // Vault is now undercollateralized (50 assets vs 100 shares)
-        assertEq(sUNIT.totalAssets(), 50e6);
+        assertEq(sUNIT.balanceOf(userA), 100e6);
+        assertEq(UNIT.balanceOf(address(sUNIT)), 100e6);
         assertEq(sUNIT.totalSupply(), 100e6);
 
-        // max limits must report 0
-        assertEq(sUNIT.maxDeposit(userA), 0);
-        assertEq(sUNIT.maxMint(userA), 0);
-        assertEq(sUNIT.maxWithdraw(userA), 0);
-        assertEq(sUNIT.maxRedeem(userA), 0);
+        // User unwraps via wrapped withdraw
+        vm.prank(userA);
+        sUNIT.withdraw(100e6, userA, userA);
 
-        // Operations revert with max limit exceeded / VaultInsolvent
-        vm.startPrank(userA);
-        vm.expectRevert();
-        sUNIT.deposit(10e6, userA);
-
-        vm.expectRevert();
-        sUNIT.redeem(50e6, userA, userA);
-        vm.stopPrank();
-
-        // Recapitalize vault
-        vm.prank(admin);
-        UNIT.mint(address(sUNIT), 50e6);
-
-        // Solvency restored
-        assertEq(sUNIT.totalAssets(), 100e6);
-        assertTrue(sUNIT.maxRedeem(userA) > 0);
-
-        vm.startPrank(userA);
-        sUNIT.redeem(100e6, userA, userA);
-        vm.stopPrank();
+        assertEq(sUNIT.balanceOf(userA), 0);
         assertEq(UNIT.balanceOf(userA), 100e6);
+        assertEq(UNIT.balanceOf(address(sUNIT)), 0);
+        assertEq(sUNIT.totalSupply(), 0);
     }
 
     function testVaultZeroDepositReverts() public {
@@ -245,10 +227,6 @@ contract ForkMainnetTest is Test {
         vm.startPrank(userA);
         vm.expectRevert();
         UNIT.mint(userA, 100e6);
-
-        // User A tries to confiscate
-        vm.expectRevert();
-        UNIT.confiscate(userA, userB, 100e6);
         vm.stopPrank();
     }
 
@@ -285,53 +263,27 @@ contract ForkMainnetTest is Test {
         vm.stopPrank();
     }
 
-    function testConfiscateMergedRole() public {
+    function testNoFreezingOrConfiscationInUnit() public {
         vm.prank(admin);
         UNIT.mint(userA, 100e6);
 
-        // Only DEFAULT_ADMIN_ROLE can confiscate
-        vm.prank(admin);
-        UNIT.confiscate(userA, admin, 100e6);
-
-        assertEq(UNIT.balanceOf(userA), 0);
-        assertEq(UNIT.balanceOf(admin), 100e6);
-    }
-
-    function testUnitFreezingAndConfiscation() public {
-        vm.prank(admin);
-        UNIT.mint(userA, 100e6);
-
-        // Admin freezes userA
-        vm.prank(admin);
-        UNIT.setFrozen(userA, true);
-        assertTrue(UNIT.isFrozen(userA));
-
-        // Frozen userA cannot transfer
-        vm.startPrank(userA);
-        vm.expectRevert(Unit.AccountFrozen.selector);
+        // User A can freely transfer tokens to User B without any freeze or whitelist restrictions
+        vm.prank(userA);
         UNIT.transfer(userB, 50e6);
-        vm.stopPrank();
+        assertEq(UNIT.balanceOf(userA), 50e6);
+        assertEq(UNIT.balanceOf(userB), 50e6);
 
-        // Frozen userA cannot deposit into sUNIT
+        // User A can deposit remaining tokens into sUNIT
         vm.startPrank(userA);
         UNIT.approve(address(sUNIT), 50e6);
-        vm.expectRevert(StakedUnit.AccountFrozen.selector);
         sUNIT.deposit(50e6, userA);
         vm.stopPrank();
 
-        // Admin can confiscate from frozen userA
-        vm.prank(admin);
-        UNIT.confiscate(userA, admin, 100e6);
+        assertEq(sUNIT.balanceOf(userA), 50e6);
         assertEq(UNIT.balanceOf(userA), 0);
-        assertEq(UNIT.balanceOf(admin), 100e6);
-
-        // Unfreeze
-        vm.prank(admin);
-        UNIT.setFrozen(userA, false);
-        assertFalse(UNIT.isFrozen(userA));
     }
 
-    function testStakedUnitConfiscation() public {
+    function testStakedUnitSovereignWithdrawal() public {
         vm.prank(admin);
         UNIT.mint(userA, 100e6);
 
@@ -342,18 +294,13 @@ contract ForkMainnetTest is Test {
 
         assertEq(sUNIT.balanceOf(userA), 100e6);
 
-        // Non-admin cannot confiscate sUNIT
-        vm.prank(userB);
-        vm.expectRevert(StakedUnit.Unauthorized.selector);
-        sUNIT.confiscate(userA, userB, 100e6);
-
-        // Admin confiscates sUNIT shares
-        vm.prank(admin);
-        sUNIT.confiscate(userA, admin, 100e6);
+        // Stakers can always withdraw their shares back to UNIT freely
+        vm.prank(userA);
+        sUNIT.withdraw(100e6, userA, userA);
 
         assertEq(sUNIT.balanceOf(userA), 0);
-        assertEq(UNIT.balanceOf(admin), 100e6);
-        assertEq(sUNIT.totalAssets(), 0);
+        assertEq(UNIT.balanceOf(userA), 100e6);
+        assertEq(UNIT.balanceOf(address(sUNIT)), 0);
         assertEq(sUNIT.totalSupply(), 0);
     }
 
@@ -729,6 +676,8 @@ contract ForkMainnetTest is Test {
         vm.stopPrank();
 
         // Keeper executes atomic claim and distribute
+        vm.expectEmit(true, false, false, true, address(minter2));
+        emit RewardsDistributed(address(distributor), 100e18, 100e6);
         vm.prank(admin);
         minter2.claimAndDistributeRewards(claims, address(distributor));
 
@@ -745,7 +694,8 @@ contract ForkMainnetTest is Test {
 
         usdd.mint(address(minter2), 10e18);
         vm.prank(admin);
-        bytes memory ret = minter2.executeCall(address(usdd), 0, abi.encodeWithSignature("transfer(address,uint256)", userA, 10e18));
+        bytes memory ret =
+            minter2.executeCall(address(usdd), 0, abi.encodeWithSignature("transfer(address,uint256)", userA, 10e18));
         bool success = abi.decode(ret, (bool));
         assertTrue(success);
 
@@ -825,6 +775,152 @@ contract ForkMainnetTest is Test {
         vm.stopPrank();
 
         assertEq(UNIT.balanceOf(userA), 1e6);
+    }
+
+    function testMinter2PauseUnpause() public {
+        bytes32 adminRole = minter2.DEFAULT_ADMIN_ROLE();
+
+        usdt.mint(userA, 100e6);
+        vm.startPrank(userA);
+        usdt.approve(address(minter2), 100e6);
+
+        uint256 deadline = block.timestamp + 1 hours;
+        uint256 nonce = minter2.nonces(userA);
+        bytes32 structHash = keccak256(abi.encode(minter2.MINT_TYPEHASH(), userA, 100e6, false, nonce, deadline));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
+        vm.stopPrank();
+
+        // Non-admin cannot pause
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, userA, adminRole
+            )
+        );
+        vm.prank(userA);
+        minter2.pause();
+
+        // Admin pauses
+        vm.prank(admin);
+        minter2.pause();
+        assertTrue(minter2.paused());
+
+        // Mint reverts when paused
+        vm.prank(userA);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        minter2.mint(100e6, false, 0, deadline, abi.encodePacked(r, s, v));
+
+        // Redeem also reverts when paused
+        vm.prank(userA);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        minter2.redeem(100e6, false, 0, deadline, abi.encodePacked(r, s, v));
+
+        // Claim and distribute also reverts when paused
+        IMultiMerkleDistributor.ClaimParam[] memory claims = new IMultiMerkleDistributor.ClaimParam[](0);
+        vm.prank(admin);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        minter2.claimAndDistributeRewards(claims, address(distributor));
+
+        // Non-admin cannot unpause
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, userA, adminRole
+            )
+        );
+        vm.prank(userA);
+        minter2.unpause();
+
+        // Admin unpauses
+        vm.prank(admin);
+        minter2.unpause();
+        assertFalse(minter2.paused());
+
+        // Mint succeeds after unpause
+        vm.prank(userA);
+        minter2.mint(100e6, false, 0, deadline, abi.encodePacked(r, s, v));
+        assertEq(UNIT.balanceOf(userA), 100e6);
+    }
+
+    function testCannotRenounceAdminRole() public {
+        bytes32 adminRole = UNIT.DEFAULT_ADMIN_ROLE();
+        bytes32 minterRole = UNIT.MINTER_ROLE();
+
+        // UNIT admin renouncement reverts
+        vm.expectRevert(Unit.CannotRenounceAdmin.selector);
+        vm.prank(admin);
+        UNIT.renounceRole(adminRole, admin);
+
+        // UNIT admin revocation reverts
+        vm.expectRevert(Unit.CannotRenounceAdmin.selector);
+        vm.prank(admin);
+        UNIT.revokeRole(adminRole, admin);
+
+        // Minter2 admin renouncement reverts
+        vm.expectRevert(Minter2.CannotRenounceAdmin.selector);
+        vm.prank(admin);
+        minter2.renounceRole(adminRole, admin);
+
+        // Minter2 admin revocation reverts
+        vm.expectRevert(Minter2.CannotRenounceAdmin.selector);
+        vm.prank(admin);
+        minter2.revokeRole(adminRole, admin);
+
+        // Non-admin roles CAN be renounced
+        vm.prank(admin);
+        UNIT.renounceRole(minterRole, admin);
+        assertFalse(UNIT.hasRole(minterRole, admin));
+    }
+
+    function testCumulativeMerkleDropZeroRootReverts() public {
+        vm.prank(admin);
+        vm.expectRevert(CumulativeMerkleDrop.ZeroRoot.selector);
+        distributor.setMerkleRoot(bytes32(0));
+
+        bytes32 validRoot = keccak256("validRoot");
+        vm.prank(admin);
+        distributor.setMerkleRoot(validRoot);
+        assertEq(distributor.merkleRoot(), validRoot);
+    }
+
+    function testMultipleSequentialMintsWithoutYield() public {
+        // Non-integer exchange rate simulating live mainnet rounding loss
+        jUSDD.accrueYield(1234567890123456);
+
+        usdt.mint(userA, 1000e6);
+        vm.startPrank(userA);
+        usdt.approve(address(minter2), 1000e6);
+
+        // Perform 10 consecutive mints without any yield accrual
+        for (uint256 i = 0; i < 10; i++) {
+            uint256 deadline = block.timestamp + 1 hours;
+            uint256 nonce = minter2.nonces(userA);
+            bytes32 structHash = keccak256(abi.encode(minter2.MINT_TYPEHASH(), userA, 10e6, false, nonce, deadline));
+            bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+            (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
+            minter2.mint(10e6, false, 10e6, deadline, abi.encodePacked(r, s, v));
+        }
+        vm.stopPrank();
+
+        assertEq(UNIT.balanceOf(userA), 100e6);
+    }
+
+    function testMintTransferFeeActiveReverts() public {
+        usdt.mint(userA, 100e6);
+        vm.startPrank(userA);
+        usdt.approve(address(minter2), 100e6);
+
+        // Turn on 10 bps fee on transfer
+        usdt.setFeeBps(10);
+
+        uint256 deadline = block.timestamp + 1 hours;
+        uint256 nonce = minter2.nonces(userA);
+        bytes32 structHash = keccak256(abi.encode(minter2.MINT_TYPEHASH(), userA, 100e6, false, nonce, deadline));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
+
+        vm.expectRevert(Minter2.TransferFeeActive.selector);
+        minter2.mint(100e6, false, 0, deadline, abi.encodePacked(r, s, v));
+        vm.stopPrank();
     }
 }
 
